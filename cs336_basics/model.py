@@ -1,6 +1,7 @@
 import torch
 import math
 from torch import nn
+from einops import rearrange
 class Linear(nn.Module):
     def __init__(self, in_features, out_features, device=None, dtype=None):
         super().__init__()
@@ -112,3 +113,215 @@ class RotaryPositionalEmbedding(nn.Module):
             (output_even, output_odd),
             dim=-1
         ).flatten(-2)
+class CausalMultiHeadSelfAttention(nn.Module):
+    def __init__(
+        self,
+        d_model, 
+        num_heads, 
+        use_rope=False,
+        max_seq_len=None, 
+        theta=10000.0, 
+        device=None, 
+        dtype=None
+    ):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_head = d_model // num_heads
+        self.use_rope = use_rope
+
+        self.q_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+        self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
+
+        if use_rope:
+            self.rope = RotaryPositionalEmbedding(
+                theta=theta,
+                d_k=self.d_head,
+                max_seq_len=max_seq_len,
+                device=device,
+            )
+        else:
+            self.rope = None
+
+    def forward(self, x, token_positions=None):
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        
+        q = rearrange(
+            q,
+            "... seq (h d) -> ... h seq d",
+            h=self.num_heads,
+        )
+        k = rearrange(
+            k,
+            "... seq (h d) -> ... h seq d",
+            h=self.num_heads,
+        )
+        v = rearrange(
+            v,
+            "... seq (h d) -> ... h seq d",
+            h=self.num_heads,
+        )
+
+        if self.rope is not None:
+            if token_positions is None:
+                sequence_length = x.shape[-2]
+                token_positions = torch.arange(
+                    sequence_length,
+                    device=x.device,
+                )
+            q = self.rope(q, token_positions)
+            k = self.rope(k, token_positions)
+        
+        sequence_length = x.shape[-2]
+        causal_mask = torch.tril(
+            torch.ones(
+                sequence_length,
+                sequence_length,
+                dtype=torch.bool,
+                device=x.device,
+            )
+        )
+        attention_output = scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            mask=causal_mask,
+        )
+
+        attention_output = rearrange(
+            attention_output,
+            "... h seq d -> ... seq (h d)"
+        )
+        return self.output_proj(attention_output)
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, num_heads, d_ff, max_seq_len=None, theta=10000.00, device=None, dtype=None):
+        super().__init__()
+        self.ln1 = RMSNorm(
+            d_model=d_model,
+            device=device,
+            dtype=dtype,
+        )
+        self.attn = CausalMultiHeadSelfAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            use_rope=True,
+            max_seq_len=max_seq_len,
+            theta=theta,
+            device=device,
+            dtype=dtype,
+        )
+        self.ln2 = RMSNorm(
+            d_model=d_model,
+            device=device,
+            dtype=dtype,
+        )
+        self.ffn = SwiGLU(
+            d_model=d_model,
+            d_ff=d_ff,
+            device=device,
+            dtype=dtype,
+        )
+    def forward(self, x, token_positions=None):
+        normalized_x = self.ln1(x)
+        attention_output = self.attn(
+            normalized_x, 
+            token_positions=token_positions,
+        )
+        h = x + attention_output
+        normalized_h = self.ln2(h)
+        ffn_output = self.ffn(normalized_h)
+        y = h + ffn_output
+        return y
+class TransformerLM(nn.Module):
+    def __init__(self, 
+        vocab_size,
+        context_length, 
+        d_model, 
+        num_layers, 
+        num_heads, 
+        d_ff, 
+        rope_theta,
+        device=None,
+        dtype=None,
+        ):
+        super().__init__()
+        self.token_embeddings = Embedding(
+            num_embeddings = vocab_size,
+            embedding_dim = d_model,
+            device=device,
+            dtype=dtype,
+        )
+        self.layers = nn.ModuleList(
+            [
+                TransformerBlock(
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    d_ff=d_ff,
+                    max_seq_len=context_length,
+                    theta=rope_theta,
+                    device=device,
+                    dtype=dtype,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.ln_final = RMSNorm(
+            d_model=d_model,
+            device=device,
+            dtype=dtype,
+        )
+        self.lm_head = Linear(
+            in_features=d_model,
+            out_features=vocab_size,
+            device=device,
+            dtype=dtype,
+        )
+    def forward(self, in_indices):
+        x = self.token_embeddings(in_indices)
+        for layer in self.layers:
+            x = layer(x)
+        x = self.ln_final(x)
+        logits = self.lm_head(x)
+        return logits
+def CrossEntropy(inputs, targets):
+    max_values = torch.amax(inputs, dim=-1, keepdim=True)
+    shifted = inputs - max_values
+    exp_values = torch.exp(shifted)
+    exp_sum = torch.sum(exp_values, dim=-1, keepdim=True)
+    log_probs = shifted - torch.log(exp_sum)
+    target_log_probs = torch.gather(
+        log_probs,
+        dim=-1,
+        index=targets.unsqueeze(-1),
+    ).squeeze(-1)
+
+    return -target_log_probs.mean()
+def GradientClipping(parameters, max_l2_norm):
+    parameters = list(parameters)
+    grads = [p.grad for p in parameters if p.grad is not None]
+    total_squared_norm = sum(
+        (grad ** 2).sum()
+        for grad in grads
+    )
+    total_norm = torch.sqrt(total_squared_norm)
+    clip_coef = max_l2_norm / (total_norm + 1e-6)
+    clip_coef = torch.clamp(clip_coef, max=1.0)
+    for param in parameters:
+        if param.grad is not None:
+            param.grad.mul_(clip_coef)
+    return None
+
+def get_lr_cosine_schedule(it, max_learning_rate, min_learning_rate, warmup_iters, cosine_cycle_iters):
+    if it < warmup_iters:
+        lr = it / warmup_iters * max_learning_rate
+    elif warmup_iters <= it <= cosine_cycle_iters:
+        lr = min_learning_rate + 0.5 * (1 + math.cos(math.pi*((it - warmup_iters)/(cosine_cycle_iters-warmup_iters))))*(max_learning_rate-min_learning_rate)
+    else:
+        lr=min_learning_rate
+    return lr
+
