@@ -324,4 +324,3 @@ def get_lr_cosine_schedule(it, max_learning_rate, min_learning_rate, warmup_iter
     else:
         lr=min_learning_rate
     return lr
-
